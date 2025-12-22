@@ -199,7 +199,8 @@ class EngineClient(ABC):
                                  logprobs=beam.logprobs,
                                  finish_reason=beam.finish_reason if
                                  beam.finish_reason is not None else "length",
-                                 stop_reason=beam.stop_reason)
+                                 stop_reason=beam.stop_reason,
+                                 run_seed=None)
                 for (i, beam) in enumerate(best_beams)
             ],
             finished=True,

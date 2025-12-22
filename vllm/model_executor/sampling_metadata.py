@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from uuid import uuid4, UUID
 from array import array
 from dataclasses import dataclass
 from typing import Optional
@@ -12,6 +13,7 @@ from vllm.sequence import (VLLM_TOKEN_ID_ARRAY_TYPE, SequenceData,
                            SequenceGroupMetadata)
 from vllm.utils import (PyObjectCache, async_tensor_h2d,
                         is_pin_memory_available, make_tensor_with_pad)
+from vllm.model_executor.utils import compute_run_seed
 
 _SAMPLING_EPS = 1e-5
 
@@ -48,12 +50,19 @@ class SequenceGroupToSample:
     prompt_logprob_indices: list[int]
     # Sample token indices from logits. Empty if sampling is not required.
     sample_indices: list[int]
+    # Run seed computed from seed and inference_id for artifact tracking
+    run_seed: Optional[int] = None
+
+
+    id: UUID = None
 
     @property
     def do_sample(self):
         return len(self.sample_indices) > 0
 
     def __post_init__(self):
+        if self.id is None:
+            self.id = uuid4()
         if len(self.prompt_logprob_indices) > 0:
             assert self.sampling_params.prompt_logprobs is not None
         if self.is_prompt:
@@ -263,6 +272,7 @@ def _prepare_seq_groups(
         sampling_params = seq_group_metadata.sampling_params
         is_prompt = seq_group_metadata.is_prompt
         generator: Optional[torch.Generator] = None
+        run_seed: Optional[int] = None
         # If the current seq group is in decode stage, it is None.
         seq_len: Optional[int] = None
         query_len: Optional[int] = None
@@ -272,10 +282,18 @@ def _prepare_seq_groups(
                                      if cache is not None else [])
         do_sample = seq_group_metadata.do_sample
 
+        if sampling_params.run_seed is not None:
+            run_seed = sampling_params.run_seed
+        elif sampling_params.seed is not None or sampling_params.inference_id is not None:
+            run_seed = compute_run_seed(sampling_params.seed,
+                                        sampling_params.inference_id)
+
         if seq_group_metadata.is_prompt:
-            if sampling_params.seed is not None:
-                generator = torch.Generator(device=device).manual_seed(
-                    sampling_params.seed)
+            if sampling_params.seed is not None or sampling_params.run_seed is not None:
+                if run_seed is None:
+                    run_seed = compute_run_seed(sampling_params.seed,
+                                               sampling_params.inference_id)
+                generator = torch.Generator(device=device).manual_seed(run_seed)
                 if generators is not None:
                     generators[seq_group_metadata.request_id] = generator
 
@@ -296,7 +314,7 @@ def _prepare_seq_groups(
                 query_lens) > 0 else 1
             sample_len = len(seq_ids) * query_len if do_sample else 0
 
-            if sampling_params.seed is not None and generators is not None:
+            if (sampling_params.seed is not None or sampling_params.run_seed is not None) and generators is not None:
                 generator = generators.get(seq_group_metadata.request_id)
 
         # Update indices to select from the model output.
@@ -346,6 +364,7 @@ def _prepare_seq_groups(
             sample_obj.seq_len = seq_len
             sample_obj.query_len = query_len
             sample_obj.generator = generator
+            sample_obj.run_seed = run_seed
             sample_obj.is_prompt = is_prompt
         else:
             sample_obj = SequenceGroupToSample(
@@ -355,6 +374,7 @@ def _prepare_seq_groups(
                 seq_len=seq_len,
                 query_len=query_len,
                 generator=generator,
+                run_seed=run_seed,
                 is_prompt=is_prompt,
                 prompt_logprob_indices=list(prompt_logprob_indices),
                 sample_indices=list(sample_indices),

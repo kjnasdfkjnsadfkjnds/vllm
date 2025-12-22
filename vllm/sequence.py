@@ -761,6 +761,7 @@ class SequenceGroup:
         self.encoder_seq = encoder_seq
         self.trace_headers = trace_headers
         self.priority = priority
+        self.run_seed: Optional[int] = None
 
         self.cached_request_output = None
 

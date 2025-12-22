@@ -6,6 +6,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from importlib.util import find_spec
 from math import inf
+from uuid import UUID
 from typing import Optional, Union
 
 import msgspec
@@ -135,6 +136,9 @@ class SamplerOutput(
     # Time taken in the model execute function. This will include model forward,
     # block/sync across workers, cpu-gpu sync time and sampling time.
     model_execute_time: Optional[float] = None
+
+    # Run seeds for sampling artifacts. Shape: (num_seq_groups,)
+    run_seeds: Optional[torch.Tensor] = None
 
     def __getitem__(self, idx: int) -> CompletionSequenceGroupOutput:
         return self.outputs[idx]
@@ -603,6 +607,21 @@ def get_pythonized_sample_results(
         elif sampling_type in (SamplingType.RANDOM, SamplingType.RANDOM_SEED):
             sample_results = _random_sample(seq_groups,
                                             multinomial_samples[sampling_type])
+        elif sampling_type == SamplingType.ENFORCED:
+            _, sample_metadata_seq_groups = sample_metadata[SamplingType.ENFORCED]
+            sample_results = []
+            for seq_group, seq_group_metadata in zip(seq_groups, sample_metadata_seq_groups):
+                enforced_token_ids = seq_group_metadata.sampling_params.enforced_token_ids
+                first_seq_id = seq_group.seq_ids[0]
+                output_token_ids = seq_group.seq_data[first_seq_id].output_token_ids_array
+                generated_token_id = None
+                if len(output_token_ids) < len(enforced_token_ids):
+                    generated_token_id = enforced_token_ids[len(output_token_ids)]
+                else:
+                    generated_token_id = enforced_token_ids[-1]
+                
+                sample_results.append(([generated_token_id], [0]))
+
         sample_results_dict.update(zip(seq_group_id, sample_results))
 
     return [
@@ -707,6 +726,31 @@ def _sample_with_torch(
                 # Store sampled tokens in output tensor.
                 sampled_token_ids_tensor[long_sample_indices] = \
                     multinomial_samples[sampling_type].to(torch.long)
+        elif sampling_type == SamplingType.ENFORCED:
+            sample_results = []
+            for seq_group in seq_groups:
+                enforced_token_ids = seq_group.sampling_params.enforced_token_ids
+                first_seq_id = seq_group.seq_ids[0]
+                output_token_ids = seq_group.seq_data[first_seq_id].output_token_ids
+                generated_token_id = None
+                if len(output_token_ids) < len(enforced_token_ids):
+                    generated_token_id = enforced_token_ids[len(output_token_ids)]
+                else:
+                    generated_token_id = enforced_token_ids[-1]
+                sample_results.append(([generated_token_id], [0]))
+            
+            if sampled_token_ids_tensor is not None:
+                sampled_token_ids_tensor[
+                    long_sample_indices] = torch.tensor(enforced_token_ids, device=logprobs.device).view(-1, 1)
+
+            num_samples = 1
+            for seq_group in seq_groups:
+                if seq_group.is_prompt:
+                    sampling_params = seq_group.sampling_params
+                    num_samples = max(
+                        num_samples,
+                        sampling_params.best_of if sampling_params.best_of is not None else 1
+                    )
 
         else:
             raise ValueError(f"Unsupported sampling type: {sampling_type}")
@@ -827,6 +871,11 @@ def get_logprobs(
     # set to -1.
     largest_num_logprobs = -1
 
+    enforced_query_indices: list[int] = []
+    enforced_token_ids: list[int] = []
+    enforced_starts: dict[UUID, int] = dict()
+    enforced_ends: dict[UUID, int] = dict()
+
     # Select indices to compute logprob from, ranks of token ids, and the top
     # k token ids from logprobs.
     for (seq_group, sample_result) in zip(sampling_metadata.seq_groups,
@@ -854,6 +903,21 @@ def get_logprobs(
                 [query_idx + parent_id for parent_id in parent_seq_ids])
             next_token_ids.extend(token_ids)
 
+            if sampling_params.enforced_tokens:
+                first_seq_id = seq_group.seq_ids[0]
+                enforced_starts[seq_group.id] = len(enforced_query_indices)
+                output_token_ids = seq_group.seq_data[first_seq_id].output_token_ids
+                if len(output_token_ids) < len(sampling_params.enforced_tokens.tokens):
+                    enforced_token = sampling_params.enforced_tokens.tokens[len(output_token_ids)] 
+                else:
+                    enforced_token = sampling_params.enforced_tokens.tokens[-1]
+                
+                for parent_id in parent_seq_ids:
+                    for token_id in enforced_token.top_token_ids:
+                        enforced_query_indices.append(query_idx + parent_id)
+                        enforced_token_ids.append(token_id)
+                enforced_ends[seq_group.id] = len(enforced_query_indices)
+
             if sampling_params.logprobs is not None:
                 largest_num_logprobs = max(largest_num_logprobs,
                                            sampling_params.logprobs)
@@ -869,6 +933,16 @@ def get_logprobs(
 
     selected_logprobs, ranks = None, None
     top_logprobs, top_token_ids = None, None
+    enforced_logprobs, enforced_ranks = None, None
+
+    if len(enforced_query_indices) > 0:
+        enforced_query_indices_gpu = torch.tensor(enforced_query_indices, device=logprobs.device)
+        enforced_token_ids_gpu = torch.tensor(enforced_token_ids, device=logprobs.device)
+        enforced_logprobs = logprobs[[
+            enforced_query_indices_gpu,
+            enforced_token_ids_gpu,
+        ]]
+        enforced_ranks = _get_ranks(logprobs[enforced_query_indices_gpu], enforced_token_ids_gpu)
 
     # If largest_num_logprobs == -1, i.e. no logprobs are requested, we can
     # skip the whole logprob calculation.
@@ -901,6 +975,9 @@ def get_logprobs(
 
         selected_logprobs = selected_logprobs.to('cpu')
         ranks = ranks.to('cpu')
+        if enforced_logprobs is not None:
+            enforced_logprobs = enforced_logprobs.to('cpu')
+            enforced_ranks = enforced_ranks.to('cpu')
 
     # Find prompt/sample logprobs.
     prompt_logprobs_per_seq_group: list[Optional[PromptLogprobs]] = []
@@ -921,6 +998,21 @@ def get_logprobs(
              seq_group, sample_result, selected_logprobs, ranks, top_token_ids,
              top_logprobs, selected_logprobs_idx, top_logprob_idx)
         sample_logprobs_per_seq_group.append(sampled_logprobs)
+
+        if seq_group.id in enforced_starts:
+            enforced_group_token_ids = enforced_token_ids[
+                enforced_starts[seq_group.id]:enforced_ends[seq_group.id]
+            ]
+            enforced_group_logprobs = enforced_logprobs[
+                enforced_starts[seq_group.id]:enforced_ends[seq_group.id]
+            ].tolist()
+            enforced_group_ranks = enforced_ranks[
+                enforced_starts[seq_group.id]:enforced_ends[seq_group.id]
+            ].tolist()
+            for token_id, logprob, rank in zip(enforced_group_token_ids, enforced_group_logprobs, enforced_group_ranks):
+                if token_id in sampled_logprobs[0]:
+                    continue
+                sampled_logprobs[0][token_id] = Logprob(logprob=logprob, rank=rank)
 
     return prompt_logprobs_per_seq_group, sample_logprobs_per_seq_group
 
@@ -1162,12 +1254,23 @@ def _build_sampler_output(
         sampled_token_probs, logprobs_tensor, sampled_token_ids = (None, None,
                                                                    None)
 
+    run_seeds_list = [
+        seq_group.run_seed if seq_group.run_seed is not None else 0
+        for seq_group in sampling_metadata.seq_groups
+    ]
+    run_seeds_tensor = torch.tensor(
+        run_seeds_list,
+        dtype=torch.int64,
+        device=logprobs_tensor.device if logprobs_tensor is not None else None
+    ) if run_seeds_list else None
+
     return SamplerOutput(
         outputs=sampler_output,
         sampled_token_probs=sampled_token_probs,
         sampled_token_ids=sampled_token_ids,
         logprobs=logprobs_tensor,
-        deferred_sample_results_args=deferred_sample_results_args)
+        deferred_sample_results_args=deferred_sample_results_args,
+        run_seeds=run_seeds_tensor)
 
 
 def _get_next_prompt_tokens(

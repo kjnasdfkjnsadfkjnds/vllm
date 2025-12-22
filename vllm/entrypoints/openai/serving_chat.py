@@ -43,6 +43,7 @@ from vllm.transformers_utils.tokenizer import AnyTokenizer, MistralTokenizer
 from vllm.transformers_utils.tokenizers import (maybe_serialize_tool_calls,
                                                 truncate_tool_call_ids,
                                                 validate_request_params)
+from vllm.validation import EnforcedToken, EnforcedTokens
 
 logger = init_logger(__name__)
 
@@ -222,6 +223,31 @@ class OpenAIServingChat(OpenAIServing):
                         default_max_tokens,
                         self.model_config.logits_processor_pattern,
                         self.default_sampling_params)
+
+                if request.inference_id:
+                    sampling_params.inference_id = request.inference_id
+
+                if request.enforced_str:
+                    toks = tokenizer(request.enforced_str,
+                                     add_special_tokens=False)
+                    sampling_params.enforced_token_ids = toks.input_ids
+                    if request.run_seed:
+                        sampling_params.run_seed = request.run_seed
+                    if sampling_params.enforced_token_ids[-1] != tokenizer.eos_token_id:
+                        sampling_params.enforced_token_ids.append(tokenizer.eos_token_id)
+                elif request.enforced_tokens:
+                    request.enforced_tokens.encode(tokenizer)
+                    sampling_params.enforced_tokens = request.enforced_tokens
+                    if request.run_seed:
+                        sampling_params.run_seed = request.run_seed
+                    sampling_params.enforced_token_ids = request.enforced_tokens.get_enforced_token_ids()
+                    if request.enforced_tokens.tokens[-1].token_id != tokenizer.eos_token_id:
+                        sampling_params.enforced_tokens.tokens.append(EnforcedToken(
+                            token=tokenizer.eos_token,
+                            top_tokens=[str(tokenizer.eos_token_id)],
+                            token_ids=[tokenizer.eos_token_id],
+                            top_token_ids=[tokenizer.eos_token_id]
+                        ))
 
                 self._log_inputs(request_id,
                                  request_prompts[i],
@@ -572,6 +598,7 @@ class OpenAIServingChat(OpenAIServing):
                             num_output_top_logprobs=request.top_logprobs,
                             return_as_token_id=request.
                             return_tokens_as_token_ids,
+                            enforced_tokens=request.enforced_tokens,
                         )
                     else:
                         logprobs = None
@@ -954,6 +981,7 @@ class OpenAIServingChat(OpenAIServing):
                     num_output_top_logprobs=request.top_logprobs,
                     tokenizer=tokenizer,
                     return_as_token_id=request.return_tokens_as_token_ids,
+                    enforced_tokens=request.enforced_tokens,
                 )
             else:
                 logprobs = None
@@ -1075,7 +1103,8 @@ class OpenAIServingChat(OpenAIServing):
                 logprobs=logprobs,
                 finish_reason="tool_calls" if auto_tools_called else
                 output.finish_reason if output.finish_reason else "stop",
-                stop_reason=output.stop_reason)
+                stop_reason=output.stop_reason,
+                run_seed=output.run_seed)
             choices.append(choice_data)
 
         if request.echo:
@@ -1123,7 +1152,12 @@ class OpenAIServingChat(OpenAIServing):
     def _get_top_logprobs(
             self, logprobs: dict[int, Logprob], top_logprobs: Optional[int],
             tokenizer: AnyTokenizer,
-            should_return_as_token_id: bool) -> list[ChatCompletionLogProb]:
+            should_return_as_token_id: bool,
+            enforced_tokens: Optional[EnforcedTokens] = None) -> list[ChatCompletionLogProb]:
+        
+        if enforced_tokens:
+            top_logprobs = len(logprobs)
+
         return [
             ChatCompletionLogProb(token=(token := self._get_decoded_token(
                 p[1],
@@ -1144,9 +1178,11 @@ class OpenAIServingChat(OpenAIServing):
         tokenizer: AnyTokenizer,
         num_output_top_logprobs: Optional[int] = None,
         return_as_token_id: Optional[bool] = None,
+        enforced_tokens: Optional[EnforcedTokens] = None,
     ) -> ChatCompletionLogProbs:
         """Create OpenAI-style logprobs."""
         logprobs_content: list[ChatCompletionLogProbsContent] = []
+
 
         should_return_as_token_id = return_as_token_id if \
             return_as_token_id is not None else self.return_tokens_as_token_ids
@@ -1180,7 +1216,7 @@ class OpenAIServingChat(OpenAIServing):
                             step_decoded.encode("utf-8", errors="replace")),
                         top_logprobs=self._get_top_logprobs(
                             step_top_logprobs, num_output_top_logprobs,
-                            tokenizer, should_return_as_token_id),
+                            tokenizer, should_return_as_token_id, enforced_tokens),
                     ))
 
         return ChatCompletionLogProbs(content=logprobs_content)

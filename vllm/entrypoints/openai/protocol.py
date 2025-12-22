@@ -24,6 +24,8 @@ from vllm.sampling_params import (BeamSearchParams, GuidedDecodingParams,
                                   RequestOutputKind, SamplingParams)
 from vllm.sequence import Logprob
 from vllm.utils import random_uuid, resolve_obj_by_qualname
+from vllm.validation import EnforcedTokens
+
 
 logger = init_logger(__name__)
 
@@ -412,6 +414,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
     kv_transfer_params: Optional[dict[str, Any]] = Field(
         default=None,
         description="KVTransfer parameters used for disaggregated serving.")
+
+    enforced_tokens: Optional[EnforcedTokens] = Field(default=None)
+    enforced_str: Optional[str] = Field(default=None)
+    inference_id: Optional[str] = Field(default=None)
+    run_seed: Optional[int] = Field(default=None)
 
     # --8<-- [end:chat-completion-extra-params]
 
@@ -1241,6 +1248,7 @@ class CompletionResponseChoice(OpenAIBaseModel):
             "including encountering the EOS token"),
     )
     prompt_logprobs: Optional[list[Optional[dict[int, Logprob]]]] = None
+    run_seed: Optional[int] = None
 
 
 class CompletionResponse(OpenAIBaseModel):
@@ -1431,6 +1439,7 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
     finish_reason: Optional[str] = "stop"
     # not part of the OpenAI spec but included in vLLM for legacy reasons
     stop_reason: Optional[Union[int, str]] = None
+    run_seed: Optional[int] = None
 
 
 class ChatCompletionResponse(OpenAIBaseModel):

@@ -47,6 +47,7 @@ class CompletionOutput:
     finish_reason: Optional[str] = None
     stop_reason: Union[int, str, None] = None
     lora_request: Optional[LoRARequest] = None
+    run_seed: Optional[int] = None
 
     def finished(self) -> bool:
         return self.finish_reason is not None
@@ -264,7 +265,8 @@ class RequestOutput:
                                          cumulative_logprob=None,
                                          logprobs=None,
                                          finish_reason=None,
-                                         stop_reason=None))
+                                         stop_reason=None,
+                                         run_seed=None))
                 output = cached_outputs[i]
 
                 # Init cached output object
@@ -283,6 +285,7 @@ class RequestOutput:
                 output.finish_reason = SequenceStatus.get_finished_reason(
                     seq.status)
                 output.stop_reason = seq.stop_reason
+                output.run_seed = seq_group.run_seed
 
             else:
                 output = CompletionOutput(
@@ -291,7 +294,8 @@ class RequestOutput:
                     seq.get_cumulative_logprob() if include_logprobs else None,
                     output_logprobs,
                     SequenceStatus.get_finished_reason(seq.status),
-                    seq.stop_reason)
+                    seq.stop_reason,
+                    run_seed=seq_group.run_seed)
 
             outputs.append(output)
 

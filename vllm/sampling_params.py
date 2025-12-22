@@ -13,6 +13,7 @@ from typing_extensions import deprecated
 
 from vllm.logger import init_logger
 from vllm.logits_process import LogitsProcessor
+from vllm.validation import EnforcedTokens
 from vllm.transformers_utils.tokenizer import AnyTokenizer
 
 logger = init_logger(__name__)
@@ -25,6 +26,7 @@ class SamplingType(IntEnum):
     GREEDY = 0
     RANDOM = 1
     RANDOM_SEED = 2
+    ENFORCED = 3
 
 
 # maybe make msgspec?
@@ -200,6 +202,13 @@ class SamplingParams(
         extra_args: Arbitrary additional args, that can be used by custom
             sampling implementations. Not used by any in-tree sampling
             implementations.
+        inference_id: Optional identifier for the inference request, used to
+            generate deterministic run_seed when combined with seed parameter.
+            Defaults to None.
+        run_seed: Computed seed value derived from seed and inference_id. When
+            provided along with enforced_str or enforced_tokens, this seed is
+            used for RNG during sampling. Automatically computed if not provided.
+            Defaults to None.
     """
 
     n: int = 1
@@ -247,6 +256,11 @@ class SamplingParams(
     # Fields used for bad words
     bad_words: Optional[list[str]] = None
     _bad_words_token_ids: Optional[list[list[int]]] = None
+    enforced_token_ids: Optional[list[int]] = None
+    enforced_tokens: Optional[EnforcedTokens] = None
+
+    inference_id: Optional[str] = None
+    run_seed: Optional[int] = None
 
     @staticmethod
     def from_optional(
@@ -280,6 +294,10 @@ class SamplingParams(
         logit_bias: Optional[Union[dict[int, float], dict[str, float]]] = None,
         allowed_token_ids: Optional[list[int]] = None,
         extra_args: Optional[dict[str, Any]] = None,
+        enforced_token_ids: Optional[list[int]] = None,
+        enforced_tokens: Optional[EnforcedTokens] = None,
+        inference_id: Optional[str] = None,
+        run_seed: Optional[int] = None,
     ) -> "SamplingParams":
         if logit_bias is not None:
             # Convert token_id to integer
@@ -322,6 +340,10 @@ class SamplingParams(
             logit_bias=logit_bias,
             allowed_token_ids=allowed_token_ids,
             extra_args=extra_args,
+            enforced_token_ids=enforced_token_ids,
+            enforced_tokens=enforced_tokens,
+            inference_id=inference_id,
+            run_seed=run_seed,
         )
 
     def __post_init__(self) -> None:
@@ -530,6 +552,8 @@ class SamplingParams(
 
     @cached_property
     def sampling_type(self) -> SamplingType:
+        if self.enforced_token_ids or self.enforced_tokens:
+            return SamplingType.ENFORCED
         if self.temperature < _SAMPLING_EPS:
             return SamplingType.GREEDY
         if self.seed is not None:
@@ -585,7 +609,8 @@ class SamplingParams(
             f"{self.spaces_between_special_tokens}, "
             f"truncate_prompt_tokens={self.truncate_prompt_tokens}, "
             f"guided_decoding={self.guided_decoding}, "
-            f"extra_args={self.extra_args})")
+            f"extra_args={self.extra_args}, "
+            f"enforced_token_ids={self.enforced_token_ids}")
 
 
 class BeamSearchParams(

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Utils for model executor."""
 import copy
+import hashlib
 from typing import Any, Optional
 
 import torch
@@ -75,3 +76,28 @@ def get_packed_modules_mapping(model: torch.nn.Module) -> dict[str, list[str]]:
         else:
             parent_map.update(child_map)
     return parent_map
+
+
+def compute_run_seed(seed: Optional[int], inference_id: Optional[str]) -> int:
+    """Compute a deterministic run_seed from seed and inference_id.
+    
+    run_seed = sha256(seed || inference_id) converted to int
+    
+    Args:
+        seed: Random seed from sampling parameters
+        inference_id: Inference identifier
+    
+    Returns:
+        Integer seed derived from SHA256 hash
+    """
+    if seed is None and inference_id is None:
+        return None
+    
+    seed_str = str(seed) if seed is not None else ""
+    inference_id_str = str(inference_id) if inference_id is not None else ""
+    combined = seed_str + inference_id_str
+    
+    hash_value = hashlib.sha256(combined.encode()).digest()
+    run_seed = int.from_bytes(hash_value[:4], byteorder='big')
+    
+    return run_seed

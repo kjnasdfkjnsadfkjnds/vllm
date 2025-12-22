@@ -1051,6 +1051,9 @@ class LLMEngine:
                         else:
                             seq_group.metrics.model_execute_time = (
                                 o.model_execute_time)
+                    
+                    if isinstance(o, SamplerOutput) and o.run_seeds is not None:
+                        seq_group.run_seed = o.run_seeds[i].item()
 
             if self.model_config.runner_type == "pooling":
                 self._process_sequence_group_outputs(seq_group, output)
